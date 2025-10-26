@@ -1,5 +1,8 @@
 use clap::Parser;
-use eframe::{egui, egui::{Color32, Stroke, Shape, Pos2, Sense, Vec2}};
+use eframe::{
+    egui,
+    egui::{Color32, Pos2, Sense, Stroke, Vec2, Shape},
+};
 use serde::Deserialize;
 use std::{
     collections::{HashMap, VecDeque},
@@ -41,9 +44,12 @@ struct DroneState {
     status: String,
     last_ts_ms: u128,
     last_seen: Instant,
+
+    // Visual smoothing / trails
     smoothed_x: f32,
     smoothed_y: f32,
-    trail: VecDeque<(f32, f32, Instant)>, // NEW: stores (x, y, timestamp)
+    // (x, y, when recorded)
+    trail: VecDeque<(f32, f32, Instant)>,
 }
 
 #[derive(Default)]
@@ -81,6 +87,8 @@ fn spawn_udp_listener(bind: String, shared: Arc<Mutex<AppState>>) {
                     if let Ok(msg) = std::str::from_utf8(&buf[..n]) {
                         if let Ok(t) = serde_json::from_str::<Telemetry>(msg) {
                             let mut guard = shared.lock().unwrap();
+
+                            // Insert or get the drone
                             let entry = guard.drones.entry(t.id).or_insert(DroneState {
                                 x: t.x,
                                 y: t.y,
@@ -89,11 +97,12 @@ fn spawn_udp_listener(bind: String, shared: Arc<Mutex<AppState>>) {
                                 status: t.status.clone(),
                                 last_ts_ms: t.ts_ms,
                                 last_seen: Instant::now(),
-                                smoothed_x: t.x,                  // <-- add
-                                smoothed_y: t.y,                  // <-- add
-                                trail: VecDeque::with_capacity(64),
+                                smoothed_x: t.x,
+                                smoothed_y: t.y,
+                                trail: VecDeque::with_capacity(128),
                             });
-                            
+
+                            // Update latest raw values
                             entry.x = t.x;
                             entry.y = t.y;
                             entry.z = t.z;
@@ -102,22 +111,28 @@ fn spawn_udp_listener(bind: String, shared: Arc<Mutex<AppState>>) {
                             entry.last_ts_ms = t.ts_ms;
                             entry.last_seen = Instant::now();
 
+                            // EMA smoothing for visual position
                             let alpha = 0.25_f32; // lower = smoother, higher = snappier
-                            entry.smoothed_x = entry.smoothed_x + alpha * (t.x - entry.smoothed_x);
-                            entry.smoothed_y = entry.smoothed_y + alpha * (t.y - entry.smoothed_y);
-                            
-                            // Record trail using smoothed coords
-                            entry.trail.push_back((entry.smoothed_x, entry.smoothed_y, Instant::now()));
-                            
-                            // Prune trail
-                            const TRAIL_MAX_POINTS: usize = 60;
-                            const TRAIL_MAX_AGE: Duration = Duration::from_secs(2);
+                            entry.smoothed_x = entry.smoothed_x + alpha * (entry.x - entry.smoothed_x);
+                            entry.smoothed_y = entry.smoothed_y + alpha * (entry.y - entry.smoothed_y);
 
+                            // Record trail using smoothed coords
+                            entry
+                                .trail
+                                .push_back((entry.smoothed_x, entry.smoothed_y, Instant::now()));
+
+                            // Prune trail by size and age (keep a long history)
+                            const TRAIL_MAX_POINTS: usize = 600;
+                            const TRAIL_MAX_AGE: Duration = Duration::from_secs(20);
                             while entry.trail.len() > TRAIL_MAX_POINTS {
                                 entry.trail.pop_front();
                             }
                             while let Some(&(_, _, when)) = entry.trail.front() {
-                                if when.elapsed() > TRAIL_MAX_AGE { entry.trail.pop_front(); } else { break; }
+                                if when.elapsed() > TRAIL_MAX_AGE {
+                                    entry.trail.pop_front();
+                                } else {
+                                    break;
+                                }
                             }
 
                             guard.total_packets += 1;
@@ -149,6 +164,7 @@ impl eframe::App for App {
                 .last_packet_at
                 .map(|t| t.elapsed().as_millis())
                 .unwrap_or(0);
+            drop(guard);
 
             ui.horizontal_wrapped(|ui| {
                 ui.heading("Telemetry Fusion Dashboard");
@@ -174,14 +190,18 @@ impl eframe::App for App {
             let grid_spacing = 40.0;
             let mut x = rect.left();
             while x <= rect.right() {
-                painter.line_segment([Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
-                    (1.0, Color32::from_gray(40)));
+                painter.line_segment(
+                    [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+                    (1.0, Color32::from_gray(40)),
+                );
                 x += grid_spacing;
             }
             let mut y = rect.top();
             while y <= rect.bottom() {
-                painter.line_segment([Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
-                    (1.0, Color32::from_gray(40)));
+                painter.line_segment(
+                    [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
+                    (1.0, Color32::from_gray(40)),
+                );
                 y += grid_spacing;
             }
 
@@ -197,52 +217,75 @@ impl eframe::App for App {
                 )
             };
 
-            // Draw drones
-            let guard = self.state.lock().unwrap();
-            for (id, d) in guard.drones.iter() {
-                let p = to_screen(d.smoothed_x, d.smoothed_y);
-                // Color derived from ID (stable, no Hsva API needed)
-                let mut h = *id as u32;
+            // Snapshot the state so we don't hold the mutex while painting
+            let snapshot: Vec<(u32, DroneState)> = {
+                let guard = self.state.lock().unwrap();
+                guard.drones.iter().map(|(k, v)| (*k, v.clone())).collect()
+            };
+
+            for (id, d) in snapshot {
+                // Stable color derived from ID
+                let mut h = id as u32;
                 h ^= h >> 16;
                 h = h.wrapping_mul(0x7feb_352d);
                 h ^= h >> 15;
                 h = h.wrapping_mul(0x846c_a68b);
                 h ^= h >> 16;
-
                 let r = (h & 0xFF) as u8;
                 let g = ((h >> 8) & 0xFF) as u8;
                 let b = ((h >> 16) & 0xFF) as u8;
 
-                let age = d.last_seen.elapsed();
-                let alpha = if age > std::time::Duration::from_secs(2) { 80 } else { 220 };
-                let color = Color32::from_rgba_unmultiplied(r, g, b, alpha);
+                // Drone dot position (smoothed)
+                let p = to_screen(d.smoothed_x, d.smoothed_y);
 
-                // Fade if stale (> 2s)
+                // Fade whole drone if no packet for >2s
                 let age = d.last_seen.elapsed();
-                let alpha = if age > Duration::from_secs(2) { 80 } else { 220 };
-                let color = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha);
-                
-                // Draw trail: fade older segments
+                let dot_alpha = if age > Duration::from_secs(2) { 80 } else { 220 };
+                let dot_color = Color32::from_rgba_unmultiplied(r, g, b, dot_alpha);
+
+                // ---- Trail (time-based fade: 0-10s full, 10-20s fade) ----
                 if d.trail.len() >= 2 {
-                    let n = d.trail.len();
-                    // Pre-map world→screen once
-                    let mut pts: Vec<Pos2> = Vec::with_capacity(n);
-                    for &(wx, wy, _) in d.trail.iter() {
-                        pts.push(to_screen(wx, wy));
+                    // Map world→screen once
+                    let mut pts: Vec<(Pos2, Instant)> = Vec::with_capacity(d.trail.len());
+                    for &(wx, wy, when) in d.trail.iter() {
+                        pts.push((to_screen(wx, wy), when));
                     }
-                
-                    for w in 1..n {
-                        let t = w as f32 / n as f32;          // 0..1 along the trail (older→newer)
-                        let seg_alpha = (40.0 + 160.0 * t) as u8; // older segments are faint
-                        let seg_color = Color32::from_rgba_unmultiplied(r, g, b, seg_alpha);
-                        let stroke = Stroke::new(2.0, seg_color);
-                        painter.add(Shape::line_segment([pts[w - 1], pts[w]], stroke));
+
+                    const FADE_START: Duration = Duration::from_secs(10); // fully visible until 10s old
+                    const FADE_END: Duration = Duration::from_secs(20); // fully faded at 20s
+                    const ALPHA_MIN: u8 = 30;
+                    const ALPHA_MAX: u8 = 240;
+
+                    // Each segment uses the newer point's age
+                    for w in 1..pts.len() {
+                        let (p1, _t1) = pts[w - 1];
+                        let (p2, t2) = pts[w];
+
+                        let age = t2.elapsed();
+                        let alpha = if age <= FADE_START {
+                            ALPHA_MAX
+                        } else if age >= FADE_END {
+                            ALPHA_MIN
+                        } else {
+                            let total = (FADE_END - FADE_START).as_secs_f32();
+                            let over = (age - FADE_START).as_secs_f32();
+                            // Gentle curve: start fading slowly, then a bit faster near the end
+                            let t = (over / total).clamp(0.0, 1.0).powf(0.7);
+                            let a = (ALPHA_MAX as f32)
+                                + t * ((ALPHA_MIN as f32) - (ALPHA_MAX as f32));
+                            a as u8
+                        };
+
+                        let stroke =
+                            Stroke::new(2.0, Color32::from_rgba_unmultiplied(r, g, b, alpha));
+                        painter.add(Shape::line_segment([p1, p2], stroke));
                     }
                 }
-                
 
-                painter.circle_filled(p, 10.0, color);
+                // Drone dot
+                painter.circle_filled(p, 10.0, dot_color);
 
+                // Label
                 let label = format!("#{id}  {:.0}%  {}", d.battery, d.status);
                 painter.text(
                     p + Vec2::new(12.0, -12.0),
@@ -251,8 +294,6 @@ impl eframe::App for App {
                     egui::FontId::proportional(14.0),
                     Color32::WHITE,
                 );
-
-
             }
 
             // Interaction overlay (optional)
