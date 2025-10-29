@@ -16,4 +16,10 @@ serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 rand = "0.8"
 
-# Time helpers (std is enough; keeping deps lean)
+[[bin]]
+name = "dashboard"
+path = "src/bin/dashboard.rs"
+
+[[bin]]
+name = "simulator"
+path = "src/bin/simulator.rs"
