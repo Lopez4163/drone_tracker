@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Telemetry Fusion Dashboard</title>
+
+    <!-- Tell Trunk to compile the `dashboard` bin to WASM and load it -->
+    <link data-trunk rel="rust" data-bin="dashboard" />
+
+    <style>
+      html, body, #app { height: 100%; margin: 0; background: #0a0b0e; }
+      /* Optional: ensure canvas consumes space */
+      canvas { display: block; }
+    </style>
+  </head>
+  <body>
+    <!-- This id MUST match WebRunner::start("app", ...) -->
+    <canvas id="app"></canvas>
+  </body>
+</html>

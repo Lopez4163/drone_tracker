@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Telemetry Fusion Dashboard</title>
+
+    <!-- Tell Trunk to compile the `dashboard` bin to WASM and load it -->
+    
+<script type="module">
+import init, * as bindings from '/YOUR_REPO_NAME/dashboard-773a60a77dbd10a1.js';
+const wasm = await init({ module_or_path: '/YOUR_REPO_NAME/dashboard-773a60a77dbd10a1_bg.wasm' });
+
+
+window.wasmBindings = bindings;
+
+
+dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
+
+</script>
+
+    <style>
+      html, body, #app { height: 100%; margin: 0; background: #0a0b0e; }
+      /* Optional: ensure canvas consumes space */
+      canvas { display: block; }
+    </style>
+  <link rel="modulepreload" href="/YOUR_REPO_NAME/dashboard-773a60a77dbd10a1.js" crossorigin="anonymous" integrity="sha384-o7NCleDoZ4e4ia0gNnyM7N56j3x5ALscKTi6PISA/CaxFPtKWQDK0NXehoQmLLle"><link rel="preload" href="/YOUR_REPO_NAME/dashboard-773a60a77dbd10a1_bg.wasm" crossorigin="anonymous" integrity="sha384-yeZ6oi9i/4BaJCNQD5O98+UaCv/RXFvTuVx8KALmZj/wpNQMJSdcvPfLSJivT2jk" as="fetch" type="application/wasm"></head>
+  <body>
+    <!-- This id MUST match WebRunner::start("app", ...) -->
+    <canvas id="app"></canvas>
+  </body>
+</html>

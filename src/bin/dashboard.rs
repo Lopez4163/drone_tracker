@@ -7,13 +7,21 @@ use eframe::{
     },
 };
 use serde::Deserialize;
-use std::{
-    collections::{HashMap, VecDeque},
-    net::UdpSocket,
-    sync::{Arc, Mutex},
-    thread,
-    time::{Duration, Instant},
-};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+
+use futures::stream::StreamExt; // (not `futures::StreamExt`)
+
+// --- time: std on native, web_time on wasm ---
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::{Duration, Instant};
+
+#[cfg(target_arch = "wasm32")]
+use web_time::{Duration, Instant};
+
+// --- networking/thread: native only ---
+#[cfg(not(target_arch = "wasm32"))]
+use std::{net::UdpSocket, Instant};
 
 #[derive(Parser, Debug)]
 #[command(name = "dashboard", about = "Telemetry Fusion Dashboard (UDP listener + egui)")]
@@ -91,7 +99,7 @@ impl App {
 }
 
 /* ------------------------------ UDP listener ------------------------------ */
-
+#[cfg(not(target_arch = "wasm32"))]
 fn spawn_udp_listener(bind: String, shared: Arc<Mutex<AppState>>) {
     thread::spawn(move || {
         let socket = UdpSocket::bind(&bind).expect("failed to bind UDP socket");
@@ -175,6 +183,192 @@ fn spawn_udp_listener(bind: String, shared: Arc<Mutex<AppState>>) {
         }
     });
 }
+
+// ===== WASM playback: calm/clean demo paths =====
+#[cfg(target_arch = "wasm32")]
+async fn start_playback(shared: Arc<Mutex<AppState>>, world: f32) {
+    use gloo_timers::future::IntervalStream;
+    use futures::stream::StreamExt;
+    use wasm_bindgen_futures::spawn_local;
+    use std::f32::consts::PI;
+
+    // ---- tuning (calm, readable) ----
+    const N: usize = 12;          // number of drones
+    const DT_MS: u32 = 33;        // ~30Hz sim
+    const DT: f32 = DT_MS as f32 / 1000.0;
+
+    const SPEED: f32 = 24.0;      // world units / s (moderate)
+    const TURN_MAX: f32 = 0.55;   // rad/s limit (keeps turns smooth)
+    const ORBIT_RATE: f32 = 0.26; // rad/s global ring rotation
+    const RING_FRACTION: f32 = 0.45; // anchor radius = world * this
+
+    const PULL_TO_ANCHOR: f32 = 0.22;  // pull strength toward anchor
+    const DRIFT_GAIN: f32 = 0.12;      // light wobble so paths feel alive
+    const SEP_RADIUS: f32 = 18.0;      // start steering away within this radius
+    const SEP_GAIN: f32 = 0.9;         // how strongly we separate within radius
+
+    const Z_SWAY: f32 = 0.4;       // vertical motion amplitude
+    const BATTERY_DRAIN: f32 = 0.003; // very slow drain
+
+    #[derive(Clone, Copy)]
+    struct SimDrone {
+        id: u32,
+        x: f32, y: f32, z: f32,
+        theta: f32,     // heading (radians)
+        phase: f32,     // per-drone phase
+        anchor_ang0: f32, // unique anchor offset around the ring
+        speed_scale: f32, // tiny per-drone variation
+        battery: f32,
+    }
+
+    // ring anchors spaced evenly; drones start tangential to the ring
+    let ring_r = world * RING_FRACTION;
+    let mut sims: [SimDrone; N] = core::array::from_fn(|i| {
+        let id = i as u32;
+        let ang = (2.0 * PI) * (i as f32) / (N as f32);
+        let x0 = ring_r * ang.cos();
+        let y0 = ring_r * ang.sin();
+        SimDrone {
+            id,
+            x: x0,
+            y: y0,
+            z: 22.0 + (id as f32 * 2.1) % 18.0,
+            theta: ang + PI * 0.5, // tangent start
+            phase: 0.31 * (id as f32 + 1.0),
+            anchor_ang0: ang,
+            speed_scale: 0.95 + 0.08 * ((i as f32) * 0.73).sin(), // 0.87..1.03
+            battery: 90.0 - (id as f32 * 1.1) % 12.0,
+        }
+    });
+
+    spawn_local(async move {
+        let mut ticks = IntervalStream::new(DT_MS);
+        let mut t_global = 0.0_f32;
+
+        while ticks.next().await.is_some() {
+            t_global += DT;
+
+            // positions snapshot for separation
+            let positions: Vec<(f32, f32)> = sims.iter().map(|d| (d.x, d.y)).collect();
+
+            // integrate motion
+            for (i, d) in sims.iter_mut().enumerate() {
+                d.phase += 0.5 * DT;
+
+                // 1) compute this drone's moving anchor on the ring (global slow orbit)
+                let anchor_ang = d.anchor_ang0 + ORBIT_RATE * t_global;
+                let ax = ring_r * anchor_ang.cos();
+                let ay = ring_r * anchor_ang.sin();
+
+                // 2) desired tangent direction along ring (gently forward motion)
+                let tan = anchor_ang + PI * 0.5;
+                let mut desired = egui::vec2(tan.cos(), tan.sin());
+
+                // 3) small pull toward anchor (keeps them near the ring)
+                let to_anchor = egui::vec2(ax - d.x, ay - d.y);
+                desired += PULL_TO_ANCHOR * to_anchor.normalized();
+
+                // 4) subtle drift (breaks perfect circles)
+                let drift = egui::vec2((1.2 * d.phase).sin(), (0.8 * d.phase).cos()) * DRIFT_GAIN;
+                desired += drift;
+
+                // 5) mild separation so dots rarely overlap
+                let mut sep = egui::vec2(0.0, 0.0);
+                let p = egui::vec2(d.x, d.y);
+                for (j, (ox, oy)) in positions.iter().enumerate() {
+                    if j == i { continue; }
+                    let op = egui::vec2(*ox, *oy);
+                    let delta = p - op;
+                    let dist = delta.length();
+                    if dist > 1e-3 && dist < SEP_RADIUS {
+                        // push away inversely with distance
+                        sep += (delta / dist) * ((SEP_RADIUS - dist) / SEP_RADIUS);
+                    }
+                }
+                if sep.length_sq() > 1e-6 {
+                    desired += SEP_GAIN * sep.normalized() * sep.length().min(1.0);
+                }
+
+                // normalize desired direction
+                let desired_dir = if desired.length_sq() > 1e-6 {
+                    desired.normalized()
+                } else {
+                    egui::vec2(d.theta.cos(), d.theta.sin())
+                };
+
+                // 6) steer heading toward desired with a turn-rate clamp
+                let desired_ang = desired_dir.y.atan2(desired_dir.x);
+                // shortest signed angle from current to desired
+                let mut d_ang = desired_ang - d.theta;
+                while d_ang >  PI { d_ang -= 2.0*PI; }
+                while d_ang < -PI { d_ang += 2.0*PI; }
+                let max_step = TURN_MAX * DT;
+                let step = d_ang.clamp(-max_step, max_step);
+                d.theta += step;
+
+                // 7) integrate position with moderate speed
+                let v = SPEED * d.speed_scale;
+                d.x += v * d.theta.cos() * DT;
+                d.y += v * d.theta.sin() * DT;
+                // gentle vertical sway
+                d.z = (d.z + Z_SWAY * (0.9 * d.phase).sin()).clamp(0.0, 120.0);
+
+                // 8) wrap softly at bounds
+                if d.x >  world { d.x -= 2.0 * world; }
+                if d.x < -world { d.x += 2.0 * world; }
+                if d.y >  world { d.y -= 2.0 * world; }
+                if d.y < -world { d.y += 2.0 * world; }
+
+                // 9) very slow battery drain
+                d.battery = (d.battery - BATTERY_DRAIN).max(10.0);
+            }
+
+            // write to app state (one lock per tick)
+            {
+                let mut guard = shared.lock().unwrap();
+
+                for d in sims.iter() {
+                    let entry = guard.drones.entry(d.id).or_insert(DroneState {
+                        x: d.x, y: d.y, z: d.z,
+                        battery: d.battery,
+                        status: "OK".to_string(),
+                        last_ts_ms: 0,
+                        last_seen: Instant::now(),
+                        smoothed_x: d.x,
+                        smoothed_y: d.y,
+                        trail: VecDeque::with_capacity(512),
+                    });
+
+                    entry.x = d.x;
+                    entry.y = d.y;
+                    entry.z = d.z;
+                    entry.battery = d.battery;
+                    entry.status = if d.battery < 12.0 { "LOW_BAT".into() } else { "OK".into() };
+                    entry.last_seen = Instant::now();
+
+                    // EMA smoothing to keep it silky (feel free to nudge 0.3–0.5)
+                    let alpha = 0.38_f32;
+                    entry.smoothed_x += alpha * (entry.x - entry.smoothed_x);
+                    entry.smoothed_y += alpha * (entry.y - entry.smoothed_y);
+
+                    // trails
+                    entry.trail.push_back((entry.smoothed_x, entry.smoothed_y, Instant::now()));
+                    const TRAIL_MAX_POINTS: usize = 900;
+                    const TRAIL_MAX_AGE: Duration = Duration::from_secs(20);
+                    while entry.trail.len() > TRAIL_MAX_POINTS { entry.trail.pop_front(); }
+                    while let Some(&(_, _, when)) = entry.trail.front() {
+                        if when.elapsed() > TRAIL_MAX_AGE { entry.trail.pop_front(); } else { break; }
+                    }
+                }
+
+                guard.total_packets += sims.len() as u64;
+                guard.last_packet_at = Some(Instant::now());
+            }
+        }
+    });
+}
+
+
 
 /* ----------------------------- UI helpers ----------------------------- */
 
@@ -594,7 +788,7 @@ impl eframe::App for App {
                     let stroke =
                         Color32::from_rgba_unmultiplied(255, 255, 255, (opacity as f32 * 0.22) as u8);
 
-                    egui::Area::new(Id::new("anchored_hud"))
+                        egui::Area::new(egui::Id::new("anchored_hud"))
                         .order(egui::Order::Foreground)
                         .fixed_pos(Pos2::new(pos.x + slide_px, pos.y))
                         .interactable(true)
@@ -660,7 +854,9 @@ impl eframe::App for App {
                                             glass_card(ui, Vec2::new(ring_w, ring_h), |ui, rect| {
                                                 let p = ui.painter_at(rect);
                                                 let secs = age.as_secs_f32();
-                                                let freshness = (1.0 - (secs / 5.0)).clamp(0.0, 1.0);
+                                                // let freshness = (1.0 - (secs / 5.0)).clamp(0.0, 1.0);
+                                                // both places you compute freshness:
+                                                let freshness = (1.0_f32 - (secs / 5.0_f32)).clamp(0.0_f32, 1.0_f32);
                                                 let col = if secs > 2.0 {
                                                     Color32::from_rgb(255, 200, 120)
                                                 } else {
@@ -672,7 +868,8 @@ impl eframe::App for App {
                                                     freshness,
                                                     col,
                                                     Color32::from_rgba_unmultiplied(
-                                                        255, 255, 255, 26),
+                                                        255, 255, 255, 26,
+                                                    ),
                                                     &if age < Duration::from_secs(1) {
                                                         format!("{} ms", age.as_millis())
                                                     } else {
@@ -818,7 +1015,10 @@ impl eframe::App for App {
                                 glass_card(ui, Vec2::new(ring_w, ring_h), |ui, rect| {
                                     let p = ui.painter_at(rect);
                                     let secs = age.as_secs_f32();
-                                    let freshness = (1.0 - (secs / 5.0)).clamp(0.0, 1.0);
+                                    // let freshness = (1.0 - (secs / 5.0)).clamp(0.0, 1.0);
+                                    // both places you compute freshness:
+                                    let freshness = (1.0_f32 - (secs / 5.0_f32)).clamp(0.0_f32, 1.0_f32);
+
                                     let col = if secs > 2.0 {
                                         Color32::from_rgb(255, 200, 120)
                                     } else {
@@ -894,7 +1094,39 @@ impl eframe::App for App {
 }
 
 /* ------------------------------- main ------------------------------- */
+#[cfg(target_arch = "wasm32")]
+fn main() {}   // noop; browser entry is web_main::start()
 
+
+
+#[cfg(target_arch = "wasm32")]
+mod web_main {
+    use super::*;
+    use eframe::wasm_bindgen::{self, prelude::*};
+
+    #[wasm_bindgen(start)]
+    pub async fn start() -> Result<(), wasm_bindgen::JsValue> {
+        console_error_panic_hook::set_once();
+
+        let world_extent = 120.0;
+        let shared = Arc::new(Mutex::new(AppState::default()));
+
+        // run the long choreographed demo
+        start_playback(shared.clone(), world_extent).await;
+
+        let web_options = eframe::WebOptions::default();
+        eframe::WebRunner::new()
+            .start(
+                "app",
+                web_options,
+                Box::new(move |_| Box::new(App::new(shared.clone(), world_extent))),
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {
     let args = Args::parse();
 
@@ -915,3 +1147,4 @@ fn main() -> eframe::Result<()> {
         Box::new(move |_| Box::new(App::new(shared.clone(), args.world_extent))),
     )
 }
+ 
