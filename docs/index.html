@@ -8,8 +8,8 @@
     <!-- Tell Trunk to compile the `dashboard` bin to WASM and load it -->
     
 <script type="module">
-import init, * as bindings from '/drone_tracker/dashboard-773a60a77dbd10a1.js';
-const wasm = await init({ module_or_path: '/drone_tracker/dashboard-773a60a77dbd10a1_bg.wasm' });
+import init, * as bindings from '/dashboard-30167af1481f4a82.js';
+const wasm = await init({ module_or_path: '/dashboard-30167af1481f4a82_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -24,7 +24,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
       /* Optional: ensure canvas consumes space */
       canvas { display: block; }
     </style>
-  <link rel="modulepreload" href="/drone_tracker/dashboard-773a60a77dbd10a1.js" crossorigin="anonymous" integrity="sha384-TUg5YbeAfQ7r8WdjBziCDTmsUVBskM+4qQmssO90iyX1bd0LacDM0Y63RbC+gYR1"><link rel="preload" href="/drone_tracker/dashboard-773a60a77dbd10a1_bg.wasm" crossorigin="anonymous" integrity="sha384-tgeZQOHULDHPOQqSI24rntqAxjSRtHTZTNmFLSloavQPvz09e+tSxcJXqHxG25JX" as="fetch" type="application/wasm"></head>
+  <link rel="modulepreload" href="/dashboard-30167af1481f4a82.js" crossorigin="anonymous" integrity="sha384-X8HcAfsRvjSXq2NEuezEGt+leEH4eYdFQ8hShACIdgzfUlLC3BDrQ4nUoW4OwanD"><link rel="preload" href="/dashboard-30167af1481f4a82_bg.wasm" crossorigin="anonymous" integrity="sha384-vivpmzQ1XZRp6+WCj5q/gM12QsTM4RopQItFsSWUIJcOODHdCIe8KLu1zKfVjDlm" as="fetch" type="application/wasm"></head>
   <body>
     <!-- This id MUST match WebRunner::start("app", ...) -->
     <canvas id="app"></canvas>
