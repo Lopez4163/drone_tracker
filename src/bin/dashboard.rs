@@ -3,14 +3,16 @@ use eframe::{
     egui,
     egui::{
         Color32, FontId, Id, Label, Margin, Pos2, Rect, RichText, Rounding, Sense, Shape, Stroke,
-        TextStyle, Vec2,
+        TextStyle, Vec2, CursorIcon,
     },
 };
 use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use futures::stream::StreamExt; // (not `futures::StreamExt`)
+// Only keep this if you're actually using IntervalStream playback in WASM.
+// It's harmless to leave in, but requires `futures = "0.3"` in Cargo.toml.
+use futures::stream::StreamExt;
 
 // --- time: std on native, web_time on wasm ---
 #[cfg(not(target_arch = "wasm32"))]
@@ -22,6 +24,7 @@ use web_time::{Duration, Instant};
 // --- networking/thread: native only ---
 #[cfg(not(target_arch = "wasm32"))]
 use std::{net::UdpSocket, Instant};
+
 
 #[derive(Parser, Debug)]
 #[command(name = "dashboard", about = "Telemetry Fusion Dashboard (UDP listener + egui)")]
@@ -739,6 +742,15 @@ impl eframe::App for App {
                 );
             }
 
+            if let Some(mouse_pos) = ui.input(|i| i.pointer.hover_pos()) {
+                let threshold_sq = 20.0 * 20.0;
+                if screen_positions.iter().any(|(_, p, _)| {
+                    (p.x - mouse_pos.x).powi(2) + (p.y - mouse_pos.y).powi(2) <= threshold_sq
+                }) {
+                    ctx.set_cursor_icon(CursorIcon::PointingHand);
+                }
+            }
+            
             // Click handling (hit-test near a drone)
             let resp = ui.interact(rect, Id::new("canvas"), Sense::click());
             if resp.clicked() {
@@ -945,6 +957,7 @@ impl eframe::App for App {
             // Keep animation smooth
             ctx.request_repaint_after(Duration::from_millis(33));
         });
+
 
         // ===== Optional centered sheet when "Expand" is pressed =====
         if self.hud_expanded {
